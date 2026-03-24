@@ -1,6 +1,6 @@
 # Jellyfin Smart Recommender
 
-A custom, Python-based recommendation engine for a local Jellyfin media server. It runs as a daily batch script on a headless Ubuntu machine, providing CPU-efficient, multi-user adaptive recommendations using vector math and cosine similarity.
+A custom, "vibe coded" (via Google Gemini) Python-based recommendation engine for a local Jellyfin media server. It runs as a daily batch script on a headless Ubuntu machine, providing CPU-efficient, multi-user adaptive recommendations using vector math and cosine similarity.
 
 ## Features
 
