@@ -4,7 +4,7 @@ import sqlite3
 import numpy as np
 import json
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from sklearn.feature_extraction import DictVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -371,7 +371,7 @@ def apply_negative_feedback(user_id, base_user_vector, current_ticks, feature_ma
     
     TICKS_PER_HOUR = 36000000000 
     MAX_PENALTY_FACTOR = 0.20 # The 'cliff' maximum penalty
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc) # <-- UPDATED TO FIX WARNING
     
     adjusted_vector = np.copy(base_user_vector)
     
@@ -379,12 +379,12 @@ def apply_negative_feedback(user_id, base_user_vector, current_ticks, feature_ma
     cursor.execute('''
         SELECT item_id, user_watch_ticks_at_rec, recommended_at, status FROM active_recommendations
         WHERE user_id = ? AND status IN ('pending', 'ignored')
-    ''')
+    ''', (user_id,)) # <-- ADDED (user_id,) TO FIX THE CRASH
     
     recs = cursor.fetchall()
     
     for item_id, ticks_at_rec, rec_at_str, status in recs:
-        rec_at_date = datetime.strptime(rec_at_str, "%Y-%m-%d %H:%M:%S")
+        rec_at_date = datetime.strptime(rec_at_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         
         # 1. The 6-Month Cooldown
         if (now - rec_at_date).days > 180:
@@ -443,7 +443,8 @@ def process_user(user_id, username):
     
     interacted_items = []
     candidate_items = []
-    now = datetime.utcnow()
+    strictly_unwatched_items = []
+    now = datetime.now(timezone.utc)
     
     for item in all_items:
         user_data = item.get("UserData", {})
@@ -455,13 +456,17 @@ def process_user(user_id, username):
         # Build profile from anything ever played/partially played
         if played or play_count > 0 or playback_ticks > 0:
             interacted_items.append(item)
+
+        # Isolate items that have never been marked as watched for reversion logic
+        if not played:
+            strictly_unwatched_items.append(item)
             
         # Determine if it's eligible to be recommended
         is_candidate = True
         if last_played_str:
             try:
                 # Jellyfin format: 2023-10-14T22:30:00.0000000Z
-                last_played_date = datetime.strptime(last_played_str[:19], "%Y-%m-%dT%H:%M:%S")
+                last_played_date = datetime.strptime(last_played_str[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
                 if (now - last_played_date).days < 180:
                     is_candidate = False # Watched in the last 6 months
             except ValueError:
@@ -482,7 +487,7 @@ def process_user(user_id, username):
 
     # Note: 'unwatched_items' is now 'candidate_items'
     gradient_playlist = get_gradient_recommendations(user_vector, candidate_items, feature_matrix, item_id_to_index)
-    validated_top_10 = apply_reversion_logic(gradient_playlist, candidate_items)
+    validated_top_10 = apply_reversion_logic(gradient_playlist, strictly_unwatched_items)
     
     log_active_recommendations(user_id, validated_top_10, current_ticks)
     append_user_audit_log(username, user_vector, vectorizer, validated_top_10)
