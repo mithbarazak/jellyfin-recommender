@@ -1,0 +1,23 @@
+# Sensitive Configuration & Backups
+.env
+.env*
+*.save
+
+# Python Virtual Environment
+venv/
+__pycache__/
+*.py[cod]
+
+# Local Databases (Keep your watch history private)
+*.db
+*.db-journal
+
+# Local Logs (Catching all variations)
+*.log
+recommender_log.md*
+
+# OS specific files
+.DS_Store
+
+# Depreciated Files
+recommend_items.py
