@@ -10,6 +10,8 @@ A custom, "vibe coded" (via Google Gemini) Python-based recommendation engine fo
 * **4-Tier Reversion Logic:** Ensures sequels are never recommended before unwatched prequels by scanning Franchise tags, Universe tags, DependsOn cross-references, and strict alphanumeric prefix sorting.
 * **S-Curve Negative Feedback Loop:** Tracks how long a recommendation sits unwatched (using actual Jellyfin playback ticks, not wall-clock time). After 20 active hours, the engine applies an S-Curve penalty to the item's tags. After 30 active hours, the penalty maximizes. Penalties automatically clear after a 6-month cooldown.
 * **Markdown Auditing:** Generates daily `.md` logs tracking global library metadata collisions (95%+ similarity), active user tag weights, and triggered reversion swaps.
+* **Active Negative Feedback Tracking:** Monitors manual playlist removals to apply a permanent 35% preference penalty to rejected titles, ensuring the engine adapts to explicit user dislikes in real-time.
+* **Smart Rejection Logic:** Compares current playlists against a persistent state of previously suggested items to accurately identify and penalize manual user rejections while avoiding false positives.
 
 ## Prerequisites
 
