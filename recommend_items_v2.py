@@ -312,8 +312,8 @@ def initialize_markdown_log():
         f.write(f"# Recommendation Engine Run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write("# =========================================\n\n")
 
-def append_user_audit_log(username, user_vector, vectorizer, validated_top_10):
-    """Appends user specific weights and reversion triggers to the markdown log."""
+def append_user_audit_log(username, user_vector, vectorizer, validated_top_10, newly_rejected_names):
+    """Appends user specific weights, rejections, and reversion triggers to the markdown log."""
     log_path = os.getenv("LOG_PATH", "recommender_log.md")
     
     feature_names = vectorizer.get_feature_names_out()
@@ -326,6 +326,14 @@ def append_user_audit_log(username, user_vector, vectorizer, validated_top_10):
         f.write("### Active User Profile (Top 10 Weights)\n")
         for tag, weight in top_tags:
             f.write(f"* **{tag}**: {weight:.4f}\n")
+        f.write("\n")
+
+        f.write("### Manual Rejections (0.35 Penalty Applied)\n")
+        if newly_rejected_names:
+            for name in newly_rejected_names:
+                f.write(f"* ❌ User manually removed `{name}` from playlist.\n")
+        else:
+            f.write("* *No new manual rejections detected.*\n")
         f.write("\n")
         
         f.write("### Reversion Triggers\n")
@@ -361,32 +369,53 @@ def run_collision_scan(feature_matrix, all_items):
                 f.write(f"* ⚠️ **{item1}** & **{item2}** (Similarity: {score:.2f})\n")
         f.write("\n---\n\n")
 
-def apply_negative_feedback(user_id, base_user_vector, current_ticks, feature_matrix, item_id_to_index):
-    """
-    Applies an S-Curve penalty to the user vector for items ignored in the playlist.
-    Penalties clear automatically after a 6-month cooldown.
-    """
+def apply_negative_feedback(user_id, base_user_vector, current_ticks, feature_matrix, item_id_to_index, manually_removed_ids, last_played_dict, id_to_name):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     TICKS_PER_HOUR = 36000000000 
-    MAX_PENALTY_FACTOR = 0.20 # The 'cliff' maximum penalty
-    now = datetime.now(timezone.utc) # <-- UPDATED TO FIX WARNING
+    MAX_PENALTY_FACTOR = 0.20 
+    REJECTION_PENALTY_FACTOR = 0.35 
+    now = datetime.now(timezone.utc) 
     
     adjusted_vector = np.copy(base_user_vector)
+    newly_rejected_names = []
     
-    # Fetch pending AND previously ignored items to re-apply the penalty dynamically
+    # 1. Process Definitive Manual Rejections First
+    for item_id in manually_removed_ids:
+        # Check the 24-hour watch buffer
+        was_watched_recently = False
+        last_played = last_played_dict.get(item_id)
+        if last_played and (now - last_played).total_seconds() < 86400:
+            was_watched_recently = True
+        
+        if not was_watched_recently:
+            item_name = id_to_name.get(item_id, "Unknown Item")
+            newly_rejected_names.append(item_name)
+            cursor.execute('''
+                UPDATE active_recommendations SET status = 'rejected' 
+                WHERE user_id = ? AND item_id = ?
+            ''', (user_id, item_id))
+
+    # 2. Fetch all relevant items to apply mathematical penalties
     cursor.execute('''
         SELECT item_id, user_watch_ticks_at_rec, recommended_at, status FROM active_recommendations
-        WHERE user_id = ? AND status IN ('pending', 'ignored')
-    ''', (user_id,)) # <-- ADDED (user_id,) TO FIX THE CRASH
+        WHERE user_id = ? AND status IN ('pending', 'ignored', 'rejected')
+    ''', (user_id,)) 
     
     recs = cursor.fetchall()
     
     for item_id, ticks_at_rec, rec_at_str, status in recs:
         rec_at_date = datetime.strptime(rec_at_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         
-        # 1. The 6-Month Cooldown
+        # Apply Permanent Rejection Penalty
+        if status == 'rejected':
+            if item_id in item_id_to_index:
+                item_vector = feature_matrix[item_id_to_index[item_id]]
+                adjusted_vector -= (item_vector * REJECTION_PENALTY_FACTOR)
+            continue 
+            
+        # The 6-Month Cooldown (Only for passive ignores)
         if (now - rec_at_date).days > 180:
             cursor.execute('''
                 UPDATE active_recommendations SET status = 'cooldown' 
@@ -394,7 +423,7 @@ def apply_negative_feedback(user_id, base_user_vector, current_ticks, feature_ma
             ''', (user_id, item_id))
             continue
             
-        # 2. Verify it wasn't recently watched
+        # Verify it wasn't partially/fully watched recently
         cursor.execute('''
             SELECT completion_percentage FROM watch_history
             WHERE user_id = ? AND item_id = ?
@@ -408,7 +437,7 @@ def apply_negative_feedback(user_id, base_user_vector, current_ticks, feature_ma
             ''', (user_id, item_id))
             continue
             
-        # 3. The S-Curve Math (Active Hours)
+        # The S-Curve Math (Active Hours)
         active_hours = (current_ticks - ticks_at_rec) / TICKS_PER_HOUR
         penalty = 0
         
@@ -420,7 +449,6 @@ def apply_negative_feedback(user_id, base_user_vector, current_ticks, feature_ma
                     WHERE user_id = ? AND item_id = ?
                 ''', (user_id, item_id))
         elif active_hours >= 20:
-            # Transition Phase: Smoothstep calculation between 20 and 30 hours
             progress = (active_hours - 20) / 10.0
             penalty = MAX_PENALTY_FACTOR * (progress ** 2 * (3 - 2 * progress))
             
@@ -431,12 +459,47 @@ def apply_negative_feedback(user_id, base_user_vector, current_ticks, feature_ma
     conn.commit()
     conn.close()
     
-    return np.maximum(adjusted_vector, 0)
+    return np.maximum(adjusted_vector, 0), newly_rejected_names
 
 def process_user(user_id, username):
     print(f"\n--- Processing User: {username} ---")
     headers = {"Authorization": f"MediaBrowser Token={API_KEY}", "Content-Type": "application/json"}
     
+    # --- TRACKING: WHAT DID WE RECOMMEND YESTERDAY? ---
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS expected_playlist (
+            user_id TEXT,
+            item_id TEXT,
+            PRIMARY KEY (user_id, item_id)
+        )
+    ''')
+    cursor.execute('SELECT item_id FROM expected_playlist WHERE user_id = ?', (user_id,))
+    expected_playlist_ids = {row[0] for row in cursor.fetchall()}
+    conn.close()
+    # --------------------------------------------------
+
+    # --- FETCH CURRENT PLAYLIST STATE ---
+    playlist_name = f"Recommended for {username}"
+    search_resp = requests.get(f"{SERVER_URL}/Users/{user_id}/Items", headers=headers, params={"SearchTerm": playlist_name, "IncludeItemTypes": "Playlist", "Recursive": "true"})
+    existing_playlists = search_resp.json().get("Items", [])
+    playlist_id = next((pl.get("Id") for pl in existing_playlists if pl.get("Name") == playlist_name), None)
+    
+    current_playlist_ids = set()
+    if playlist_id:
+        items_resp = requests.get(f"{SERVER_URL}/Playlists/{playlist_id}/Items", headers=headers, params={"UserId": user_id, "Fields": "SeriesId"})
+        for i in items_resp.json().get("Items", []):
+            current_playlist_ids.add(i.get("Id"))
+            if i.get("SeriesId"): 
+                current_playlist_ids.add(i.get("SeriesId"))
+                
+    # Calculate exact manual removals
+    manually_removed_ids = set()
+    if expected_playlist_ids:
+        manually_removed_ids = expected_playlist_ids - current_playlist_ids
+    # ------------------------------------
+
     params = {"IncludeItemTypes": "Movie,Series", "Recursive": "true", "Fields": "Tags,Genres,UserData,ProductionYear,SortName,People"}
     response = requests.get(f"{SERVER_URL}/Users/{user_id}/Items", headers=headers, params=params)
     all_items = response.json().get("Items", [])
@@ -444,31 +507,33 @@ def process_user(user_id, username):
     interacted_items = []
     candidate_items = []
     strictly_unwatched_items = []
+    last_played_dict = {}
+    id_to_name = {}
     now = datetime.now(timezone.utc)
     
     for item in all_items:
+        item_id = item.get("Id")
+        id_to_name[item_id] = item.get("Name")
+        
         user_data = item.get("UserData", {})
         played = user_data.get("Played", False)
         play_count = user_data.get("PlayCount", 0)
         playback_ticks = user_data.get("PlaybackPositionTicks", 0)
         last_played_str = user_data.get("LastPlayedDate")
         
-        # Build profile from anything ever played/partially played
         if played or play_count > 0 or playback_ticks > 0:
             interacted_items.append(item)
 
-        # Isolate items that have never been marked as watched for reversion logic
         if not played:
             strictly_unwatched_items.append(item)
             
-        # Determine if it's eligible to be recommended
         is_candidate = True
         if last_played_str:
             try:
-                # Jellyfin format: 2023-10-14T22:30:00.0000000Z
                 last_played_date = datetime.strptime(last_played_str[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                last_played_dict[item_id] = last_played_date
                 if (now - last_played_date).days < 180:
-                    is_candidate = False # Watched in the last 6 months
+                    is_candidate = False 
             except ValueError:
                 pass
                 
@@ -483,14 +548,13 @@ def process_user(user_id, username):
         print(f"Skipping {username}: Not enough watch history.")
         return
 
-    user_vector = apply_negative_feedback(user_id, user_vector, current_ticks, feature_matrix, item_id_to_index)
+    user_vector, newly_rejected_names = apply_negative_feedback(user_id, user_vector, current_ticks, feature_matrix, item_id_to_index, manually_removed_ids, last_played_dict, id_to_name)
 
-    # Note: 'unwatched_items' is now 'candidate_items'
     gradient_playlist = get_gradient_recommendations(user_vector, candidate_items, feature_matrix, item_id_to_index)
     validated_top_10 = apply_reversion_logic(gradient_playlist, strictly_unwatched_items)
     
     log_active_recommendations(user_id, validated_top_10, current_ticks)
-    append_user_audit_log(username, user_vector, vectorizer, validated_top_10)
+    append_user_audit_log(username, user_vector, vectorizer, validated_top_10, newly_rejected_names)
 
     new_item_ids = []
     for rec in validated_top_10:
@@ -508,12 +572,6 @@ def process_user(user_id, username):
         print("No valid items found to add.")
         return
 
-    playlist_name = f"Recommended for {username}"
-    search_resp = requests.get(f"{SERVER_URL}/Users/{user_id}/Items", headers=headers, params={"SearchTerm": playlist_name, "IncludeItemTypes": "Playlist", "Recursive": "true"})
-    existing_playlists = search_resp.json().get("Items", [])
-    
-    playlist_id = next((pl.get("Id") for pl in existing_playlists if pl.get("Name") == playlist_name), None)
-
     if playlist_id:
         items_resp = requests.get(f"{SERVER_URL}/Playlists/{playlist_id}/Items", headers=headers, params={"UserId": user_id})
         entry_ids = [i.get("PlaylistItemId") for i in items_resp.json().get("Items", []) if i.get("PlaylistItemId")]
@@ -524,6 +582,16 @@ def process_user(user_id, username):
     else:
         requests.post(f"{SERVER_URL}/Playlists", headers=headers, json={"Name": playlist_name, "Ids": new_item_ids, "UserId": user_id, "MediaType": "Video"})
         print(f"Success! Playlist '{playlist_name}' created.")
+
+    # --- SAVE EXPECTED PLAYLIST FOR NEXT RUN ---
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM expected_playlist WHERE user_id = ?', (user_id,))
+    for item_id in new_item_ids:
+        cursor.execute('INSERT INTO expected_playlist (user_id, item_id) VALUES (?, ?)', (user_id, item_id))
+    conn.commit()
+    conn.close()
+    # -------------------------------------------
 
 if __name__ == "__main__":
     initialize_markdown_log()
